@@ -42,11 +42,31 @@ jobs:
             docker save python:3.12-alpine -o ~/sandbox-img.tar
           fi
 
-      - name: Run tournament (HF models — reachable from a cloud runner)
+      # Full 10-model coverage: provider-free (Gemini/Groq) is Poland-localhost (:3031), unreachable
+      # from a cloud runner. We reach it through an SSH local-forward over the SAME key already used for
+      # the scp deploy — no new public exposure, no new secret, no nginx change. HF models go direct.
+      - name: Open SSH tunnel to Poland provider-free (:3031)
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/poland_key
+          chmod 600 ~/.ssh/poland_key
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ExitOnForwardFailure=yes \
+              -i ~/.ssh/poland_key -fN -L 3031:127.0.0.1:3031 \
+              "${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}" || echo "ssh tunnel launch failed"
+          up=no
+          for i in $(seq 1 10); do
+            if curl -sf --max-time 3 http://127.0.0.1:3031/health >/dev/null 2>&1; then up=yes; break; fi
+            sleep 1
+          done
+          echo "tunnel_up=$up"
+          [ "$up" = yes ] && echo "provider-free reachable via tunnel" \
+            || echo "::warning::provider-free tunnel down — its 4 models will error this run; the 6 HF models are unaffected"
+
+      - name: Run tournament (all 10 — HF direct + provider-free via tunnel)
         env:
           FREE_KEY: ${{ secrets.FREE_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          BENCH_BACKENDS: hf
+          # FREE_URL defaults to http://127.0.0.1:3031 -> the SSH-forwarded port. No BENCH_BACKENDS filter => all 10 models.
           SANDBOX_IMG: python:3.12-alpine
           RESULTS_PATH: results.json
         run: node bench/bench-run.mjs
@@ -80,6 +100,6 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: results.json
           target: /opt/bench/
-# Coverage note: the 6 HuggingFace-Router models run fully from GHA. provider-free (Gemini/Groq) is
-# Poland-localhost (:3031) and intentionally excluded here via BENCH_BACKENDS=hf. For all-10 coverage,
-# run on Poland (dashboard "Run" button or `node /opt/bench/bench-run.mjs`). model-watcher stays local (super-rule).
+# Coverage: all 10 models run from GHA — 6 HF-Router models direct, 4 provider-free (Gemini/Groq) via the
+# SSH tunnel to Poland :3031. If the tunnel is down the 4 provider-free models error but the run still
+# publishes (HF models + JSON gate). model-watcher stays local on Poland cron (super-rule, not migrated).
