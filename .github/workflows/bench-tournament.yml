@@ -1,0 +1,85 @@
+name: bench-tournament
+# Free coding-model tournament on a free GitHub-hosted runner (RULE-GHA-FIRST-01).
+# Zero-dependency Node + cached lightweight Docker sandbox. Validates results before deploy so a
+# failed/empty run NEVER overwrites the server's last-good leaderboard on bench.evotop.pro.
+on:
+  schedule:
+    - cron: '0 4 * * 1'   # weekly, Monday 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-tournament
+  cancel-in-progress: false
+
+jobs:
+  tournament:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # bench-run.mjs is ZERO-dependency -> no npm install, nothing to cache for node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Cache the sandbox image tarball (super-rule: actions/cache, minimize build time).
+      - name: Cache sandbox image
+        uses: actions/cache@v4
+        with:
+          path: ~/sandbox-img.tar
+          key: sandbox-python-3.12-alpine-v1
+
+      - name: Load or pull sandbox image
+        run: |
+          if [ -f ~/sandbox-img.tar ]; then
+            docker load -i ~/sandbox-img.tar
+          else
+            docker pull python:3.12-alpine
+            docker save python:3.12-alpine -o ~/sandbox-img.tar
+          fi
+
+      - name: Run tournament (HF models — reachable from a cloud runner)
+        env:
+          FREE_KEY: ${{ secrets.FREE_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BENCH_BACKENDS: hf
+          SANDBOX_IMG: python:3.12-alpine
+          RESULTS_PATH: results.json
+        run: node bench/bench-run.mjs
+
+      # GATE: validate JSON before sending — a broken/empty result must NOT overwrite the server copy.
+      - name: Validate results.json
+        id: validate
+        run: |
+          if node -e "const d=require('./results.json'); if(!Array.isArray(d.results)||!d.results.length) process.exit(1); if(d.results.filter(r=>r.passed>0).length===0) process.exit(1);"; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "results.json OK: $(node -e "console.log(require('./results.json').results.length)") models"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::results.json invalid/empty — SKIPPING deploy, server keeps last-good leaderboard"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results.json
+          if-no-files-found: warn
+
+      - name: Deploy results.json to Poland dashboard (only if valid)
+        if: steps.validate.outputs.valid == 'true'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: results.json
+          target: /opt/bench/
+# Coverage note: the 6 HuggingFace-Router models run fully from GHA. provider-free (Gemini/Groq) is
+# Poland-localhost (:3031) and intentionally excluded here via BENCH_BACKENDS=hf. For all-10 coverage,
+# run on Poland (dashboard "Run" button or `node /opt/bench/bench-run.mjs`). model-watcher stays local (super-rule).
